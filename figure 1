@@ -1,0 +1,403 @@
+rm(list=ls())
+library(Matrix)
+library(mnormt)
+library(mvtnorm)
+library(DepthProc)#用于计算depth
+#library(ddalpha)
+library(PEtests)#Yu（2022）对应的包
+library(parallel)
+library(foreach)
+library(doParallel)
+
+no_cores <- detectCores()-3 # 检测核数，并设置使用的数量
+cl = makeCluster(no_cores)	  
+registerDoParallel(cl)
+# 载入并行时需要用包
+clusterEvalQ(cl, library(Matrix))
+clusterEvalQ(cl, library(mnormt))
+clusterEvalQ(cl, library(DepthProc))
+clusterEvalQ(cl, library(mvtnorm))
+#clusterEvalQ(cl, library(ddalpha))
+clusterEvalQ(cl, library(PEtests))
+
+
+####0.全局变量####
+#0.1.需要讨论的变动参数
+#p——变量维度p=c（50,100,150）
+#tau——变点位置；tau=c(35,50,65);n1，n2——two population's sample size
+
+#0.2固定的参数
+n=100#总的样本个数
+vv=20#two-sample test中最少的样本的“sample”中样本的个数
+B=5000#计算control limit 所需次数
+SIM=1000#计算detection rate 等所需重复次数
+alpha=0.05#false alarm rate
+#飘移大小设定：通常，最小就是0.1起步，到个位数如7等
+delt=c(0.15,0.3,0.5,1,1.5)#飘移大小
+#飘移比例设定：稀疏就是1-20%这样，致密就是大于这个到100%
+#eta=c(0.01,0.05,0.1,0.15,0.2)#飘移变量比例
+#eta=c(0.01,0.05,0.2,0.5,0.8)#前面3个是sparse，后面是dense
+eta=c(0.01,0.05,0.1,0.5,0.8)#前面3个是sparse，后面是dense(1,5,10,50,80个变量)
+####1.定义模拟过程需要的步骤及函数####
+#1.1生成数据
+#1.1.1定义SIG1的两种形式
+#function：independent
+cov_f1=function(p){
+    omiga=diag(1,p)
+    return(omiga)
+}
+#function：correlated
+cov_f2=function(p){
+    omiga=matrix(rep(0,p^2),p,p)
+    for (i in 1:p) {
+        for (j in 1:p) {
+            omiga[i,j]=0.6^abs(i-j)
+        }
+    }
+    return(omiga)
+}
+
+#1.1.2定义SIG2中D中4种U——SIG2=SIG1+thet*U
+#统一得根据变化得变量来设定U
+U_f=function(p,eta,delt){
+    A=matrix(0,p,p)
+    pp=ceiling(p*eta)
+    for (i in 1:pp) {
+        for (j in 1:pp) {
+            A[i,j]=delt
+            
+        }
+        
+    }
+    return(A)
+}
+
+#function:计算矩阵的平方根
+matrix_sqrt=function(A){
+    # 对矩阵 A 进行特征值分解
+    eigen_decomp <- eigen(A)
+    
+    # 得到特征值矩阵 D 和特征向量矩阵 V
+    D <- diag(eigen_decomp$values)
+    V <- eigen_decomp$vectors
+    
+    # 计算特征值矩阵 D 的每个元素的平方根
+    D_sqrt <- diag(sqrt(eigen_decomp$values))
+    
+    # 计算矩阵 A 的平方根
+    A_sqrt <- V %*% D_sqrt %*% t(V)
+    
+    # 输出结果
+    return(A_sqrt)
+    
+}
+
+#1.1.3生成数据
+#function：不同分布的数据需要调整这个函数中z的生成方式
+#normal
+generate_f=function(n,p,miu,SIG){
+    SIG_sqrt=matrix_sqrt(SIG)
+    dat=matrix(NA,n,p)
+    for (u in 1:n) {
+        z=rnorm(p,0,1)
+        dat[u,]=SIG_sqrt%*%z+miu
+    }
+    return(dat)
+}
+#t
+#freedom=4时，mean=0，var=4/(4-2)=2;所以需要除以sqrt(2)
+generate_f=function(n,p,miu,SIG){
+    SIG_sqrt=matrix_sqrt(SIG)
+    dat=matrix(NA,n,p)
+    for (u in 1:n) {
+        z=rt(p,df = 4)/sqrt(2)#根据zhu（2017），自由度为12的t分布，即t（12）
+        dat[u,]=SIG_sqrt%*%z+miu
+    }
+    return(dat)
+}
+#gamma
+#shape=4,scale=0.5时，mean=4*0.5=2，var=4*0.5^2=1;所以需要减去mean
+generate_f=function(n,p,miu,SIG){
+    SIG_sqrt=matrix_sqrt(SIG)
+    dat=matrix(NA,n,p)
+    for (u in 1:n) {
+        z=rgamma(p,shape = 4,scale = 0.5)-4*0.5#根据zhu（2017），shape=4，scale=0.5的中心化gamma
+        dat[u,]=SIG_sqrt%*%z+miu
+    }
+    return(dat)
+}
+
+#1.2定义test函数：给定生成好的sample 1和sample 2，计算假定变点为l时的检验统计量
+#1.2.1 mean & covariance ——利用PEtests包现成函数
+#对于cauchy检验统计量，其值可能无穷大或小，不适合，排除
+#对于fisher和chisq两种检验统计量，都为非负，所以将没有值的地方设为0也不影响最大值及其位子
+#fisher法中要计算log，检验统计量可能会出现无穷大的情形,这样控制线就可能是Inf
+#综上，关于Yu（2022）提出的3种方法，只有chisq这种适合用于构造监控统计量
+
+#1.2.2 multivariate phase I mean&covariance depth-based——Li(2014)
+#function:calculate depth of xi(i=1,..,n1) in dataset (x1,...,xn1)
+#注意：Mahalanobis方法，当n1=1时，p个数在p个数中的depth，输出结果有10个
+#当维度变大后，Tukey方法计算不出来
+#Projection方法可以计算，但是每次结果不同
+#Lp方法是Euclidean的推广，即p=2
+#综上，此处使用Euclidean depth构建Li（2014）的方案
+#计算depth时，xj样本量必须大于2。因为，当只有1个样本时，就默认是算xi中p个数据在xj中p个数据的depth
+Di_f=function(x,n1){
+    #calculate depth of xi(i=1,..,n1) in dataset (x1,...,xn1)
+    D_n1i=c()
+    for (i in 1:n1) {
+        D_n1i[i]=depth(x[i,],x[1:n1,],method = 'Euclidean')#Mahalanobis，Tukey,Projection(默认)，Lp
+    }
+    return(D_n1i)
+}
+
+#function:calculate depth of xj(j=n1+1,..,n) in dataset (x1,...,xn1) and R_n1
+Dj_f=function(x,n1,n){
+    D_n1j=c()
+    for (j in (n1+1):n) {
+        D_n1j[j-n1]=depth(x[j,],x[1:n1,],method = 'Euclidean')
+    }
+    return(D_n1j)
+}
+
+#function:calculate Q(n1)
+Q_f=function(Di,Dj){
+    R=c()
+    for (j in 1:length(Dj)) {
+        R[j]=sum(Di<Dj[j])+1/2*sum(Di==Dj[j])
+    }
+    #calculate Q
+    Q=sum(R)
+    return(Q)
+}
+
+#function:calculate SQ(n1)
+SQ_ff=function(x,n1,n){
+    Di=Di_f(x,n1)
+    Dj=Dj_f(x,n1,n)
+    Q=Q_f(Di,Dj)
+    SQ=(n1*(n-n1)/2-Q)/sqrt(n1*(n-n1)*(n+1)/12)
+    return(SQ)
+}
+
+#function:calculate SQ(n1)——计算Li（2014）的统计量只需要这一个函数（上面函数便于理解和调整）
+SQ_f=function(x,n1,n){
+    #depth
+    D=sapply(1:n, function(j) depth(x[j,], x[1:n1,],method = 'Euclidean'))
+    Di=D[1:n1]
+    Dj=D[(n1+1):n]
+    #R
+    R=sapply(1:length(Dj), function(j) sum(Di < Dj[j]) + 1/2 * sum(Di == Dj[j]))
+    #Q
+    Q=sum(R)
+    #SQ(n1)
+    SQ=(n1 * (n - n1) / 2 - Q) / sqrt(n1 * (n-n1) * (n+1) / 12)
+    return(SQ)
+}
+
+####2.simulation  function####
+#function:计算受控过程时，3种控制图的一次监控统计量
+#Tchi_meanandcovc代表Yu(2022)中的平方和
+#Tcau_meanandcovc代表将dense mean（ Chen and Qin (2010)），dense covariance（Liand Chen (2012)）平方和
+#T_mult代表Li（2016）中的欧式深度
+icteststa_f=function(n,p,miu1,SIG1,vv){
+    #IC data
+    x=generate_f(n,p,miu1,SIG1)
+    
+    #HD
+    #T_meanandcovc=rep(NA,n-vv)
+    Tchi_meanandcovc=Tcau_meanandcovc=SQi=rep(0,n-vv)
+    for (l in vv:(n-vv)) {
+        x_1=x[1:l,];x_2=x[(l+1):n,]
+        #选择chisq method
+        tm=meantest(x_1,x_2,method='cq',delta=NULL)$stat
+        tc=covtest(x_1,x_2,method='lc',delta=NULL)$stat
+        Tcau_meanandcovc[l]=tm^2+tc^2
+        Tchi_meanandcovc[l]=simultest.pe.chisq(x_1,x_2)$stat
+        
+        
+        SQi[l]=SQ_f(x,l,n)
+    }
+    Tchi_meanandcov=max(Tchi_meanandcovc)
+    Tcau_meanandcov=max(Tcau_meanandcovc)
+    
+    T_mult=max(SQi)
+    
+    return(c(Tchi_meanandcov,Tcau_meanandcov,T_mult))
+}
+#foreach(i=1:100,.combine = 'cbind')%dopar%icteststa_f(50,50,100,rep(0,100),diag(1,100),10)
+
+
+#function:detection power and change point estimation(比icteststa_f函数多输出变点的估计值)
+simu_f=function(n1,n2,p,miu1,miu2,SIG1,SIG2,vv,CL,SIM,tau){
+    n=n1+n2
+    
+    CLchi_meanandcov=CL[1]
+    CLcau_meanandcov=CL[2]
+    CL_mult=CL[3]
+    
+    Tchi_meanandcovS=Tcau_meanandcovS=T_multS=rep(NA,SIM)
+    tauchi_meanandcovS=taucau_meanandcovS=tau_multS=rep(NA,SIM)
+    for (s in 1:SIM) {
+        #IC & OC data
+        x1=generate_f(n1,p,miu1,SIG1)
+        x2=generate_f(n2,p,miu2,SIG2)
+        x=rbind(x1,x2)
+        
+        #HD
+        Tchi_meanandcovc=Tcau_meanandcovc=SQi=rep(0,n-vv)
+        for (l in vv:(n-vv)) {
+            x_1=x[1:l,];x_2=x[(l+1):n,]
+            tm=meantest(x_1,x_2,method='cq',delta=NULL)$stat
+            tc=covtest(x_1,x_2,method='lc',delta=NULL)$stat
+            Tcau_meanandcovc[l]=tm^2+tc^2
+            Tchi_meanandcovc[l]=simultest.pe.chisq(x_1,x_2)$stat
+            SQi[l]=SQ_f(x,l,n)
+        }
+        
+        Tchi_meanandcovS[s]=max(Tchi_meanandcovc)
+        tauchi_meanandcovS[s]=which.max(Tchi_meanandcovc)
+        Tcau_meanandcovS[s]=max(Tcau_meanandcovc)
+        taucau_meanandcovS[s]=which.max(Tcau_meanandcovc)
+        
+        T_multS[s]=max(SQi)
+        tau_multS[s]=which.max(SQi)
+        
+    }
+    #detection power
+    dpower1=sum(Tchi_meanandcovS>=CLchi_meanandcov)/SIM   #HD——chisq
+    dpower2=sum(Tcau_meanandcovS>=CLcau_meanandcov)/SIM
+    dpower3=sum(T_multS>=CL_mult)/SIM               #multivariate
+    
+    
+    ##Post-signal diagnostic
+    # τ's estimation
+    #SIM个模拟中，发出OC信号的位置
+    ocid1=which(Tchi_meanandcovS>=CLchi_meanandcov)   #HD——chisq
+    ocid2=which(Tcau_meanandcovS>=CLcau_meanandcov)
+    ocid3=which(T_multS>=CL_mult)               #multivariate
+    
+    
+    #HD——chisq
+    if (length(ocid1)==0) {
+        psd1_1=Inf#偏差无穷大代表SIM个实验中没有1个发出了OC信号
+        psd1_2=psd1_3=-Inf#概率无穷小代表SIM个实验中没有1个发出了OC信号
+    }else{
+        #对这些发出OC信号的模拟，计算其τ^heat
+        tau_heat1=tauchi_meanandcovS[ocid1]
+        #计算|τ^heat-τ|
+        tau_dif1=abs(tau_heat1-tau)
+        #Post-signal diagnostic
+        psd1_1=mean(tau_dif1)      #mean bias
+        psd1_2=sum(tau_dif1<=3)/SIM#pro of detecting the change point within 3 steps
+        psd1_3=sum(tau_dif1<=5)/SIM#pro of detecting the change point within 5 steps
+    }
+    
+    if (length(ocid2)==0) {
+        psd2_1=Inf#偏差无穷大代表SIM个实验中没有1个发出了OC信号
+        psd2_2=psd2_3=-Inf#概率无穷小代表SIM个实验中没有1个发出了OC信号
+    }else{
+        #对这些发出OC信号的模拟，计算其τ^heat
+        tau_heat2=taucau_meanandcovS[ocid2]
+        #计算|τ^heat-τ|
+        tau_dif2=abs(tau_heat2-tau)
+        #Post-signal diagnostic
+        psd2_1=mean(tau_dif2)      #mean bias
+        psd2_2=sum(tau_dif2<=3)/SIM#pro of detecting the change point within 3 steps
+        psd2_3=sum(tau_dif2<=5)/SIM#pro of detecting the change point within 5 steps
+    }
+    #multivariate
+    if (length(ocid3)==0) {
+        psd3_1=Inf
+        psd3_2=psd3_3=-Inf
+    }else{
+        #对这些发出OC信号的模拟，计算其τ^heat
+        tau_heat3=tau_multS[ocid3]                      
+        #计算|τ^heat-τ|
+        tau_dif3=abs(tau_heat3-tau)
+        #Post-signal diagnostic
+        psd3_1=mean(tau_dif3)
+        psd3_2=sum(tau_dif3<=3)/SIM
+        psd3_3=sum(tau_dif3<=5)/SIM
+        
+    }
+    
+    return(c(dpower1,dpower2,dpower3,
+             psd1_1,psd1_2,psd1_3,
+             psd2_1,psd2_2,psd2_3,
+             psd3_1,psd3_2,psd3_3))
+    
+}
+
+#变点位置
+tau=n1=65;n2=n-n1
+
+
+
+
+####3 simulation-p50####
+#维度
+p=50
+
+#3.1 independent（cov_f1）
+#3.1.1  calculate control limit
+#不同的Σ1对应不同的受控状态，故CL不同
+miu1=rep(0,p);SIG1=cov_f1(p)
+t0=Sys.time();t0
+icteststa=foreach(i=1:B,.combine = 'cbind')%dopar%icteststa_f(n,p,miu1,SIG1,vv)
+#write.csv(icteststa,"C:/Users/jk096/Desktop/重要文件云备份/phase I chart for HD mean &covariance/result/norm/icteststa_np50_independentsig.csv")
+CLchi_meanandcov=sort(icteststa[1,])[(1-alpha)*B]
+CLcau_meanandcov=sort(icteststa[2,])[(1-alpha)*B]
+CL_mult=sort(icteststa[3,])[(1-alpha)*B]
+CL=c(CLchi_meanandcov,CLcau_meanandcov,CL_mult);CL
+t1=Sys.time();t=t1-t0;t#1.8 hours
+
+#3.1.2 detection power and Post-signal diagnostic
+#
+miu2=matrix(NA,length(eta)*length(delt),p)
+SIG2=array(NA,dim = c(p,p,length(eta)*length(delt)))
+for (i in 1:length(eta)) {
+    etaa=ceiling(eta[i]*p)
+    for (j in 1:length(delt)) {
+        miu2[(i-1)*length(eta)+j,]=c(rep(delt[j],etaa),rep(0,p-etaa))
+        SIG2[,,(i-1)*length(eta)+j]=SIG1+U_f(p,eta[i],delt[j])
+    }
+    
+}
+t0=Sys.time();t0
+result1=foreach(i=1:nrow(miu2),.combine = 'cbind')%dopar%
+    simu_f(n1,n2,p,miu1,miu2[i,],SIG1,SIG2[,,i],vv,CL,SIM,tau)
+result1_1=cbind(result1,CL)
+t1=Sys.time();t=t1-t0;t
+t
+
+#3.2 correlated（cov_f2）——与3.1节唯一不同的就是SIG1
+#3.2.1  calculate control limit
+#不同的Σ1对应不同的受控状态，故CL不同
+miu1=rep(0,p);SIG1=cov_f2(p)
+t0=Sys.time();t0
+icteststa=foreach(i=1:B,.combine = 'cbind')%dopar%icteststa_f(n,p,miu1,SIG1,vv)
+CLchi_meanandcov=sort(icteststa[1,])[(1-alpha)*B]
+CLcau_meanandcov=sort(icteststa[2,])[(1-alpha)*B]
+CL_mult=sort(icteststa[3,])[(1-alpha)*B]
+CL=c(CLchi_meanandcov,CLcau_meanandcov,CL_mult);CL
+t1=Sys.time();t=t1-t0;t#
+t
+
+#3.2.2 detection power and Post-signal diagnostic
+miu2=matrix(NA,length(eta)*length(delt),p)
+SIG2=array(NA,dim = c(p,p,length(eta)*length(delt)))
+for (i in 1:length(eta)) {
+    etaa=ceiling(eta[i]*p)
+    for (j in 1:length(delt)) {
+        miu2[(i-1)*length(eta)+j,]=c(rep(delt[j],etaa),rep(0,p-etaa))
+        SIG2[,,(i-1)*length(eta)+j]=SIG1+U_f(p,eta[i],delt[j])
+    }
+    
+}
+t0=Sys.time();t0
+result2=foreach(i=1:nrow(miu2),.combine = 'cbind')%dopar%
+    simu_f(n1,n2,p,miu1,miu2[i,],SIG1,SIG2[,,i],vv,CL,SIM,tau)
+result1_2=cbind(result2,CL)
+t1=Sys.time();t=t1-t0;t#15.58955 hours
+t
