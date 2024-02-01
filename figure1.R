@@ -21,12 +21,12 @@ delt=c(0.15,0.3,0.5,1,1.5)
 eta=c(0.01,0.05,0.1,0.5,0.8)
 ####1.####
 #1.1
-#function£ºindependent
+#functionï¼šindependent
 cov_f1=function(p){
     omiga=diag(1,p)
     return(omiga)
 }
-#function£ºcorrelated
+#functionï¼šcorrelated
 cov_f2=function(p){
     omiga=matrix(rep(0,p^2),p,p)
     for (i in 1:p) {
@@ -97,7 +97,7 @@ generate_f=function(n,p,miu,SIG){
 }
 
 
-# multivariate phase I mean&covariance depth-based¡ª¡ªLi(2014)
+# multivariate phase I mean&covariance depth-basedâ€”â€”Li(2014)
 #function:calculate SQ(n1)
 SQ_f=function(x,n1,n){
     #depth
@@ -178,20 +178,20 @@ simu_f=function(n1,n2,p,miu1,miu2,SIG1,SIG2,vv,CL,SIM,tau){
         
     }
     #detection power
-    dpower1=sum(Tchi_meanandcovS>=CLchi_meanandcov)/SIM   #HD¡ª¡ªchisq
+    dpower1=sum(Tchi_meanandcovS>=CLchi_meanandcov)/SIM   #HDâ€”â€”chisq
     dpower2=sum(Tcau_meanandcovS>=CLcau_meanandcov)/SIM
     dpower3=sum(T_multS>=CL_mult)/SIM               #multivariate
     
     
     ##Post-signal diagnostic
-    # ¦Ó's estimation
+    # Ï„'s estimation
     
-    ocid1=which(Tchi_meanandcovS>=CLchi_meanandcov)   #HD¡ª¡ªchisq
+    ocid1=which(Tchi_meanandcovS>=CLchi_meanandcov)   #HDâ€”â€”chisq
     ocid2=which(Tcau_meanandcovS>=CLcau_meanandcov)
     ocid3=which(T_multS>=CL_mult)               #multivariate
     
     
-    #HD¡ª¡ªchisq
+    #HDâ€”â€”chisq
     if (length(ocid1)==0) {
         psd1_1=Inf
         psd1_2=psd1_3=-Inf
@@ -249,7 +249,7 @@ tau=n1=50;n2=n-n1
 ####3 simulation-p50####
 p=50
 
-#3.1 independent£¨cov_f1£©
+#3.1 independentï¼ˆcov_f1ï¼‰
 #3.1.1  calculate control limit
 miu1=rep(0,p);SIG1=cov_f1(p)
 t0=Sys.time();t0
@@ -279,32 +279,3 @@ result1_1=cbind(result1,CL)
 t1=Sys.time();t=t1-t0;t
 t
 
-#3.2 correlated£¨cov_f2£©
-#3.2.1  calculate control limit
-miu1=rep(0,p);SIG1=cov_f2(p)
-t0=Sys.time();t0
-icteststa=foreach(i=1:B,.combine = 'cbind')%dopar%icteststa_f(n,p,miu1,SIG1,vv)
-CLchi_meanandcov=sort(icteststa[1,])[(1-alpha)*B]
-CLcau_meanandcov=sort(icteststa[2,])[(1-alpha)*B]
-CL_mult=sort(icteststa[3,])[(1-alpha)*B]
-CL=c(CLchi_meanandcov,CLcau_meanandcov,CL_mult);CL
-t1=Sys.time();t=t1-t0;t#
-t
-
-#3.2.2 detection power and Post-signal diagnostic
-miu2=matrix(NA,length(eta)*length(delt),p)
-SIG2=array(NA,dim = c(p,p,length(eta)*length(delt)))
-for (i in 1:length(eta)) {
-    etaa=ceiling(eta[i]*p)
-    for (j in 1:length(delt)) {
-        miu2[(i-1)*length(eta)+j,]=c(rep(delt[j],etaa),rep(0,p-etaa))
-        SIG2[,,(i-1)*length(eta)+j]=SIG1+U_f(p,eta[i],delt[j])
-    }
-    
-}
-t0=Sys.time();t0
-result2=foreach(i=1:nrow(miu2),.combine = 'cbind')%dopar%
-    simu_f(n1,n2,p,miu1,miu2[i,],SIG1,SIG2[,,i],vv,CL,SIM,tau)
-result1_2=cbind(result2,CL)
-t1=Sys.time();t=t1-t0;t#
-t
